@@ -22,7 +22,30 @@ use crate::script::{self, Runner};
 use crate::transport::{self, Link, RxEvent};
 
 const SEND_INTERVAL: Duration = Duration::from_millis(80); // throttle sends while dragging
-const CURRENT_POLL: Duration = Duration::from_millis(1000);
+/// A pulsed function button holds the function on this long per press:
+/// a short blip -- the decoder sees the edge and fires its effect once.
+const FUNC_PULSE: Duration = Duration::from_millis(80);
+// The station never pushes current -- <c> is request/reply only -- so
+// this poll rate IS the meter's refresh rate. 4 Hz is still trivial
+// traffic for the station and the link.
+const CURRENT_POLL: Duration = Duration::from_millis(250);
+
+// Current-meter ballistics. The <c> samples jump around with every
+// motor, so the display shows an exponential average: slow enough on
+// the way up to smooth the jitter (~1.5 s to settle at 4 Hz), and
+// gentler still on the way down, so the reading holds steady through
+// dips and drains over several seconds when the load really drops.
+const CURRENT_ATTACK: f32 = 0.15;
+const CURRENT_DECAY: f32 = 0.125;
+
+/// Fold one <c> sample into the running average; the first sample primes it.
+fn smooth_current(avg: Option<f32>, sample: f32) -> f32 {
+    let Some(avg) = avg else {
+        return sample;
+    };
+    let alpha = if sample >= avg { CURRENT_ATTACK } else { CURRENT_DECAY };
+    avg + alpha * (sample - avg)
+}
 
 // Console tag colours (same palette as the Tk app).
 const COL_TX: Color32 = Color32::from_rgb(0x88, 0xc0, 0xd0);
@@ -103,7 +126,7 @@ pub struct ThrottleApp {
 
     // track power / current
     power_state: String,
-    current_ma: Option<i64>, // last reading from <c>; None = unknown
+    current_avg: Option<f32>, // smoothed <c> readings; None = unknown
     max_ma: Option<i64>,     // motor driver capability
     trip_ma: Option<i64>,    // software circuit breaker limit
     overload: bool,          // latched by <p2>, cleared by <p0>/<p1>
@@ -183,7 +206,7 @@ impl ThrottleApp {
             tx,
             status: "Disconnected".to_string(),
             power_state: "power: unknown".to_string(),
-            current_ma: None,
+            current_avg: None,
             max_ma: None,
             trip_ma: None,
             overload: false,
@@ -365,7 +388,7 @@ impl ThrottleApp {
     }
 
     fn reset_current(&mut self) {
-        self.current_ma = None;
+        self.current_avg = None;
         self.max_ma = None;
         self.trip_ma = None;
         self.overload = false;
@@ -396,6 +419,28 @@ impl ThrottleApp {
                 // a stale value must not be replayed at the loco on
                 // reconnect.
                 panel.pending_speed = None;
+            }
+            self.panels[i] = panel;
+        }
+    }
+
+    /// Turn off pulsed functions whose hold time has elapsed.
+    fn pulse_tick(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.panels.len() {
+            if self.link.is_none() {
+                return;
+            }
+            let mut panel = std::mem::take(&mut self.panels[i]);
+            for n in 0..NFUNC {
+                if panel.pulse_off[n].is_some_and(|t| now >= t) {
+                    // Cleared even on a failed send: the transport is gone
+                    // and reset_link_state will zero everything anyway.
+                    panel.pulse_off[n] = None;
+                    if self.send_cmd(&format!("<F {} {n} 0>", panel.active_cab), false) {
+                        panel.func_state[n] = false;
+                    }
+                }
             }
             self.panels[i] = panel;
         }
@@ -647,7 +692,7 @@ impl ThrottleApp {
         if nums.is_empty() {
             return;
         }
-        self.current_ma = Some(nums[0]);
+        self.current_avg = Some(smooth_current(self.current_avg, nums[0] as f32));
         if nums.len() >= 3 {
             self.max_ma = Some(nums[1]);
             self.trip_ma = Some(nums[2]);
@@ -756,14 +801,16 @@ impl ThrottleApp {
                 let (frac, text, color) = if self.overload {
                     (1.0, "OVERLOAD".to_string(), Some(COL_ERR))
                 } else {
-                    match (self.current_ma, limit) {
+                    match (self.current_avg, limit) {
                         (None, _) => (0.0, "current: --".to_string(), None),
-                        (Some(ma), Some(limit)) => (
-                            (ma as f32 / limit as f32).clamp(0.0, 1.0),
-                            format!("{ma} mA / {limit} mA trip"),
+                        (Some(avg), Some(limit)) => (
+                            (avg / limit as f32).clamp(0.0, 1.0),
+                            format!("{} mA avg / {limit} mA trip", avg.round() as i64),
                             None,
                         ),
-                        (Some(ma), None) => (0.0, format!("{ma} mA"), None),
+                        (Some(avg), None) => {
+                            (0.0, format!("{} mA avg", avg.round() as i64), None)
+                        }
                     }
                 };
                 ui.add(egui::ProgressBar::new(frac).desired_width(300.0));
@@ -931,7 +978,12 @@ impl ThrottleApp {
         });
 
         ui.group(|ui| {
-            ui.label(RichText::new("Functions (right-click a button: momentary/toggle)").strong());
+            ui.label(
+                RichText::new(
+                    "Functions (right-click a button to cycle: hold / latching / pulsed)",
+                )
+                .strong(),
+            );
             let visible = panel.visible_funcs();
             let cols = panel.func_columns();
             let spacing = ui.spacing().item_spacing.x;
@@ -970,10 +1022,15 @@ impl ThrottleApp {
         }
     }
 
-    /// One function button: momentary (<F 1> on press, <F 0> on release) or
-    /// toggle (one command per press, alternating 1/0 -- a sound decoder
-    /// acts on every edge, so any on/off pair per click toots twice).
-    /// Right-click flips the mode; toggle mode shows as underlined text.
+    /// One function button, in one of three modes cycled by right-click:
+    ///  - hold (momentary): <F 1> on press, <F 0> on release;
+    ///  - latching (toggle): one command per press, alternating 1/0 -- a
+    ///    sound decoder acts on every edge, so any on/off pair per click
+    ///    toots twice; shown as underlined text;
+    ///  - pulsed: press fires <F 1> and the app sends the <F 0> itself
+    ///    FUNC_PULSE later, whatever the mouse does; shown as three dots
+    ///    under the text.
+    ///
     /// A green border frame shows the true state from <l>.
     fn func_button(
         &mut self,
@@ -1000,6 +1057,16 @@ impl ThrottleApp {
                     text = text.underline();
                 }
                 let resp = ui.add_sized([width, 36.0], egui::Button::new(text));
+                if panel.pulse_funcs.contains(&n) {
+                    // The pulse marker: three dots tucked under the label.
+                    ui.painter().text(
+                        egui::pos2(resp.rect.center().x, resp.rect.bottom() - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        ". . .",
+                        egui::FontId::proportional(10.0),
+                        ui.visuals().strong_text_color(),
+                    );
+                }
 
                 // Act on press/release edges, like the Tk ButtonPress/
                 // ButtonRelease bindings.
@@ -1007,8 +1074,24 @@ impl ThrottleApp {
                     && ui.input(|inp| inp.pointer.primary_down());
                 let was_held = panel.held[i];
                 panel.held[i] = held_now;
+                let momentary =
+                    !panel.toggle_funcs.contains(&n) && !panel.pulse_funcs.contains(&n);
                 if held_now && !was_held {
-                    if panel.toggle_funcs.contains(&n) {
+                    if panel.pulse_funcs.contains(&n) {
+                        // Pulsed: fire once and let pulse_tick send the off.
+                        // Strictly one pulse per press -- while a pulse is
+                        // still running, further presses are ignored; the
+                        // next one arms only after the off has gone out.
+                        if panel.pulse_off[i].is_none()
+                            && self.send_cmd(
+                                &format!("<F {} {n} 1>", panel.active_cab),
+                                false,
+                            )
+                        {
+                            panel.func_state[i] = true;
+                            panel.pulse_off[i] = Some(Instant::now() + FUNC_PULSE);
+                        }
+                    } else if panel.toggle_funcs.contains(&n) {
                         // Updated on a good send so a fast second press flips
                         // the right way before the <l> broadcast lands.
                         let state = !panel.func_state[i];
@@ -1024,16 +1107,21 @@ impl ThrottleApp {
                         // the link is corrected by the next <l>.
                         self.send_cmd(&format!("<F {} {n} 1>", panel.active_cab), false);
                     }
-                } else if was_held && !held_now && !panel.toggle_funcs.contains(&n) {
+                } else if was_held && !held_now && momentary {
                     self.send_cmd(&format!("<F {} {n} 0>", panel.active_cab), false);
                 }
 
+                // Right-click cycles hold -> latching -> pulsed -> hold.
                 if resp.secondary_clicked() {
                     if panel.toggle_funcs.remove(&n) {
-                        self.log(format!("-- F{n} mode: momentary"), Tag::Info);
+                        panel.pulse_funcs.insert(n);
+                        self.log(format!("-- F{n} mode: pulsed"), Tag::Info);
+                    } else if panel.pulse_funcs.remove(&n) {
+                        panel.pulse_off[i] = None;
+                        self.log(format!("-- F{n} mode: hold (momentary)"), Tag::Info);
                     } else {
                         panel.toggle_funcs.insert(n);
-                        self.log(format!("-- F{n} mode: toggle"), Tag::Info);
+                        self.log(format!("-- F{n} mode: latching"), Tag::Info);
                     }
                     *needs_save = true;
                 }
@@ -1905,11 +1993,38 @@ fn tool_icon_button(
     resp.on_hover_text(tip)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_average_smooths_in_both_directions() {
+        // first sample primes the average directly
+        assert_eq!(smooth_current(None, 1000.0), 1000.0);
+        // a spike is averaged in gently...
+        let up = smooth_current(Some(1000.0), 2000.0);
+        assert_eq!(up, 1000.0 + CURRENT_ATTACK * 1000.0);
+        // ...and a dropped load drains even more gently: a single zero
+        // sample dents the reading by an eighth, nothing more
+        let down = smooth_current(Some(1000.0), 0.0);
+        assert_eq!(down, 1000.0 - CURRENT_DECAY * 1000.0);
+        assert!(down >= 800.0);
+        // and the average converges to a steady reading (30 samples is
+        // 7.5 s at the 4 Hz poll -- the slow direction, by design)
+        let mut avg = 400.0;
+        for _ in 0..30 {
+            avg = smooth_current(Some(avg), 800.0);
+        }
+        assert!((avg - 800.0).abs() < 10.0);
+    }
+}
+
 impl eframe::App for ThrottleApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump();
         self.speed_tick();
+        self.pulse_tick();
         self.current_tick();
         self.script_tick();
 

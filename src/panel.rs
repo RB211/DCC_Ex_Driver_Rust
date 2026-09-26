@@ -23,7 +23,8 @@ pub struct LocoPanel {
     // configuration
     pub name: String,
     pub active_cab: u32,
-    pub toggle_funcs: BTreeSet<u8>,
+    pub toggle_funcs: BTreeSet<u8>, // latching buttons
+    pub pulse_funcs: BTreeSet<u8>,  // one press = one timed pulse
     pub show_funcs: BTreeSet<u8>,
     pub labels: BTreeMap<u8, String>,
 
@@ -33,6 +34,7 @@ pub struct LocoPanel {
     pub direction: u8,           // 1 = forward, 0 = reverse
     pub func_state: [bool; NFUNC], // the true state, mirrored from <l>
     pub held: [bool; NFUNC],     // momentary buttons currently pressed
+    pub pulse_off: [Option<Instant>; NFUNC], // armed auto-off for pulsed buttons
 
     // send/sync state -- see CLAUDE.md "Key invariants"
     pub pending_speed: Option<u8>, // one-shot request, not a slider mirror
@@ -55,6 +57,7 @@ impl LocoPanel {
             name: cfg.name.clone(),
             active_cab: cfg.address,
             toggle_funcs: cfg.toggle_funcs.clone(),
+            pulse_funcs: cfg.pulse_funcs.clone(),
             show_funcs: cfg.show_funcs.clone(),
             labels: cfg.labels.clone(),
             cab_entry: cfg.address.to_string(),
@@ -62,6 +65,7 @@ impl LocoPanel {
             direction: 1,
             func_state: [false; NFUNC],
             held: [false; NFUNC],
+            pulse_off: [None; NFUNC],
             pending_speed: None,
             last_state: None,
             last_sent: Instant::now(),
@@ -75,6 +79,7 @@ impl LocoPanel {
             name: self.name.clone(),
             address: self.active_cab,
             toggle_funcs: self.toggle_funcs.clone(),
+            pulse_funcs: self.pulse_funcs.clone(),
             show_funcs: self.show_funcs.clone(),
             labels: self.labels.clone(),
         }
@@ -125,6 +130,8 @@ impl LocoPanel {
     pub fn reset_link_state(&mut self) {
         self.pending_speed = None;
         self.last_state = None;
+        // An armed pulse-off must not fire into a new connection.
+        self.pulse_off = [None; NFUNC];
     }
 
     /// After a successful <!>: this loco is stopped, whatever it was doing.

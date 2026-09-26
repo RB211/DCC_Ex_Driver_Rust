@@ -28,7 +28,8 @@ pub fn config_path() -> PathBuf {
 pub struct LocoCfg {
     pub name: String,
     pub address: u32,
-    pub toggle_funcs: BTreeSet<u8>,
+    pub toggle_funcs: BTreeSet<u8>, // latching buttons
+    pub pulse_funcs: BTreeSet<u8>,  // one press = one timed pulse
     pub show_funcs: BTreeSet<u8>,
     pub labels: BTreeMap<u8, String>,
 }
@@ -39,6 +40,7 @@ impl LocoCfg {
             name: String::new(),
             address,
             toggle_funcs: DEFAULT_TOGGLE.iter().copied().collect(),
+            pulse_funcs: BTreeSet::new(),
             show_funcs: FUNCTIONS.collect(),
             labels: BTreeMap::new(),
         }
@@ -92,6 +94,12 @@ fn clean_loco_cfg(raw: &Value) -> Option<LocoCfg> {
     if let Some(set) = obj.get("toggle_funcs").and_then(func_set) {
         cfg.toggle_funcs = set;
     }
+    if let Some(set) = obj.get("pulse_funcs").and_then(func_set) {
+        cfg.pulse_funcs = set;
+    }
+    // a button has exactly one mode; if a hand-edited file lists a
+    // function in both sets, pulse wins
+    cfg.toggle_funcs = &cfg.toggle_funcs - &cfg.pulse_funcs;
     if let Some(set) = obj.get("show_funcs").and_then(func_set) {
         cfg.show_funcs = set;
     }
@@ -188,6 +196,7 @@ pub fn save_app_cfg(
                 "name": c.name,
                 "address": c.address,
                 "toggle_funcs": c.toggle_funcs.iter().collect::<Vec<_>>(),
+                "pulse_funcs": c.pulse_funcs.iter().collect::<Vec<_>>(),
                 "show_funcs": c.show_funcs.iter().collect::<Vec<_>>(),
                 "labels": c.labels.iter()
                     .map(|(n, l)| (n.to_string(), l.clone()))
@@ -244,6 +253,16 @@ mod tests {
         assert_eq!(c.show_funcs, [1u8, 2].into_iter().collect());
         assert_eq!(c.labels.get(&2).map(String::as_str), Some("Horn"));
         assert_eq!(c.labels.len(), 1);
+    }
+
+    #[test]
+    fn pulse_wins_a_mode_conflict() {
+        let cfgs = cfgs_from_json(
+            "{\"locos\": [{\"toggle_funcs\": [3, 4], \"pulse_funcs\": [4, 5]}]}",
+        );
+        let c = &cfgs[0];
+        assert_eq!(c.toggle_funcs, [3u8].into_iter().collect());
+        assert_eq!(c.pulse_funcs, [4u8, 5].into_iter().collect());
     }
 
     #[test]

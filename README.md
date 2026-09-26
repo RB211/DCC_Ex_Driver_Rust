@@ -11,8 +11,10 @@ Feature-equivalent with the Python app and shares the same config file
 
 - TCP (port 2560) and USB serial (115200) transports, `<s>` on connect
 - Per-loco tabs with address, speed slider, colour-coded direction toggle,
-  STOP / E-STOP ALL, and F0–F28 buttons (per-button momentary/toggle via
-  right-click, per-loco visible subset and labels via Setup)
+  STOP / E-STOP ALL, and F0–F28 buttons (right-click cycles each button
+  through hold / latching / pulsed — pulsed fires one timed one-shot per
+  press and shows three dots under the label; per-loco visible subset and
+  labels via Setup)
 - Track power controls, current polling with trip-scaled bar and latched
   overload display
 - Programming tab: service-mode address/CV read-write, CV29 bit editor
