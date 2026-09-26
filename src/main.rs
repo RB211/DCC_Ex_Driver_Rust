@@ -25,9 +25,15 @@ mod script;
 mod transport;
 
 fn main() -> eframe::Result {
+    // --version answers on stdout and exits before any GUI comes up, so
+    // the installer (and anyone at a shell) can ask the binary what it is.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("DCC-EX Native Throttle")
+            .with_title(concat!("DCC-EX Native Throttle v", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1180.0, 980.0])
             .with_min_inner_size([720.0, 640.0]),
         ..Default::default()
