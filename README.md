@@ -19,6 +19,22 @@ Feature-equivalent with the Python app and shares the same config file
   (bits 6–7 preserved), POM writes, live NMRA CV name lookup
 - Console with colour-tagged log and raw command entry
 
+Beyond the Python app (Rust-only additions, stored under new keys in the
+shared config file, which the Python app ignores):
+
+- Automation tab: named scripts in a small line-based language (`speed`,
+  `forward`/`reverse`, `stop`, `estop`, `func`, `pulse`, `wait`, `power`,
+  `throw`/`close`, `send`, nestable `repeat N … end`, `#` comments),
+  parsed in full before anything is sent and executed non-blocking from
+  the frame loop with rate-capped sends
+- Layout tab: a grid track plan (straights, auto-orienting Left/Right
+  curves, diagonals with levelling ramps to carry a turnout's diverging
+  leg into a siding, crossings, turnouts in eight orientations) with a
+  built-in editor; clicking a turnout sends
+  `<T id 1|0>`, and route colouring follows the station's `<H>` broadcasts
+  (`<JT>` roster/state sync on connect). Turnouts must be defined on the
+  command station under the same IDs.
+
 Built on [egui/eframe](https://github.com/emilk/egui) (immediate mode — the
 Tk version's `syncing` re-entrancy guard is unnecessary by construction; the
 other state-machine invariants documented in the parent repository's

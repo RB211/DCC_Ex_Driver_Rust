@@ -19,7 +19,9 @@
 mod app;
 mod config;
 mod cv;
+mod layout;
 mod panel;
+mod script;
 mod transport;
 
 fn main() -> eframe::Result {

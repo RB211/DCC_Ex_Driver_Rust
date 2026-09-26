@@ -1,5 +1,6 @@
 //! The throttle application: transport ownership, shared UI (connection,
-//! track power, console), the Run/Programming tabs and the loco tab roster.
+//! track power, console), the Run/Programming/Automation/Layout tabs and
+//! the loco tab roster.
 //!
 //! Functional port of the Tk app. Immediate mode changes one thing for the
 //! better: widget callbacks don't exist, so the `syncing` re-entrancy guard
@@ -13,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 
-use crate::config::{self, LocoCfg, MAX_ADDR};
+use crate::config::{self, LocoCfg, ScriptCfg, MAX_ADDR};
 use crate::cv::{cv_desc, cv_name};
+use crate::layout::{self, Cell, Layout, Piece, TKind, Tool};
 use crate::panel::{LocoPanel, MAX_SPEED, NFUNC};
+use crate::script::{self, Runner};
 use crate::transport::{self, Link, RxEvent};
 
 const SEND_INTERVAL: Duration = Duration::from_millis(80); // throttle sends while dragging
@@ -32,6 +35,31 @@ const COL_FWD: Color32 = Color32::from_rgb(0x2e, 0x7d, 0x32);
 const COL_REV: Color32 = Color32::from_rgb(0xef, 0x6c, 0x00);
 const COL_ESTOP: Color32 = Color32::from_rgb(0xc6, 0x28, 0x28);
 const COL_FUNC_ON: Color32 = Color32::from_rgb(0x2e, 0x7d, 0x32);
+
+// Layout canvas palette.
+const COL_TRACK: Color32 = Color32::from_rgb(0x8a, 0x91, 0x99);
+const COL_ROUTE_SET: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
+const COL_ROUTE_OFF: Color32 = Color32::from_rgb(0x45, 0x4a, 0x50);
+const COL_GRID: Color32 = Color32::from_rgb(0x28, 0x2e, 0x34);
+
+/// Starter script shown when the config has none yet; doubles as a demo of
+/// the command set.
+const EXAMPLE_SCRIPT: &str = "\
+# Example: drive loco 3 out and back, tooting the horn on each departure.
+# See \"Command reference\" below for the full command list.
+power on
+forward 3
+pulse 3 2 1.0      # horn (F2) for one second
+speed 3 60
+wait 8
+stop 3
+wait 2
+reverse 3
+pulse 3 2 1.0
+speed 3 60
+wait 8
+stop 3
+";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tag {
@@ -56,6 +84,8 @@ impl Tag {
 enum MainTab {
     Run,
     Programming,
+    Automation,
+    Layout,
 }
 
 pub struct ThrottleApp {
@@ -97,6 +127,21 @@ pub struct ThrottleApp {
     cv29_high: u8, // CV29 bits 6-7, preserved from the last confirmed read
     cv29_text: String,
 
+    // automation
+    scripts: Vec<ScriptCfg>,
+    script_sel: usize,
+    script_dirty: bool, // editor/name changes not yet written to disk
+    runner: Option<Runner>,
+    run_status: String,
+
+    // layout
+    layout: Layout,
+    layout_edit: bool,
+    tool: Tool,
+    turnout_kind: TKind, // orientation the Turnout tool places
+    sel_turnout: Option<(u32, u32)>,
+    turnout_id_entry: String,
+
     // console
     log: Vec<(Tag, String)>,
     raw: String,
@@ -118,6 +163,14 @@ impl ThrottleApp {
         });
 
         let (tx, rx) = channel();
+        let cfg = config::load_app_cfg();
+        let mut scripts = cfg.scripts;
+        if scripts.is_empty() {
+            scripts.push(ScriptCfg {
+                name: "Example".to_string(),
+                text: EXAMPLE_SCRIPT.to_string(),
+            });
+        }
         let mut app = ThrottleApp {
             mode_serial: false,
             host: "192.168.4.1".to_string(),
@@ -149,13 +202,24 @@ impl ThrottleApp {
             cv29_bits: [false; 6],
             cv29_high: 0,
             cv29_text: "CV29 = --".to_string(),
+            scripts,
+            script_sel: 0,
+            script_dirty: false,
+            runner: None,
+            run_status: "idle".to_string(),
+            layout: Layout::from_json(&cfg.layout),
+            layout_edit: false,
+            tool: Tool::Track(Piece::EW),
+            turnout_kind: TKind::EwNe,
+            sel_turnout: None,
+            turnout_id_entry: String::new(),
             log: Vec::new(),
             raw: String::new(),
         };
-        for cfg in config::load_loco_cfgs() {
+        for loco in cfg.locos {
             let id = app.next_id;
             app.next_id += 1;
-            app.panels.push(LocoPanel::from_cfg(&cfg, id));
+            app.panels.push(LocoPanel::from_cfg(&loco, id));
         }
         app.refresh_ports();
         app
@@ -171,9 +235,14 @@ impl ThrottleApp {
 
     fn save_config(&mut self) {
         let cfgs: Vec<LocoCfg> = self.panels.iter().map(|p| p.to_cfg()).collect();
-        if let Err(e) = config::save_loco_cfgs(&cfgs) {
-            let path = config::config_path();
-            self.log(format!("-- could not save {}: {e}", path.display()), Tag::Err);
+        match config::save_app_cfg(&cfgs, &self.scripts, self.layout.to_json()) {
+            // Every save writes the whole file, scripts included, so any
+            // successful save clears the Automation tab's dirty marker.
+            Ok(()) => self.script_dirty = false,
+            Err(e) => {
+                let path = config::config_path();
+                self.log(format!("-- could not save {}: {e}", path.display()), Tag::Err);
+            }
         }
     }
 
@@ -270,6 +339,9 @@ impl ThrottleApp {
                     // sync every loco tab instead of guessing
                     self.send_cmd(&format!("<t {cab}>"), false);
                 }
+                // Turnout states for the Layout tab; the <jT> roster reply
+                // fans out into one <JT id> query per turnout.
+                self.send_cmd("<JT>", false);
             }
             Err(e) => {
                 self.status = format!("Connection failed: {e}");
@@ -285,6 +357,10 @@ impl ThrottleApp {
         self.status = why.to_string();
         self.power_state = "power: unknown".to_string();
         self.reset_current(); // a stale reading is worse than no reading
+        self.layout.states.clear(); // same rule for turnout states
+        if self.runner.take().is_some() {
+            self.run_status = "stopped: disconnected".to_string();
+        }
         self.log(format!("-- {why}"), Tag::Info);
     }
 
@@ -342,6 +418,59 @@ impl ThrottleApp {
         }
         for p in &mut self.panels {
             p.estop_zero();
+        }
+    }
+
+    /// Advance the running automation script, if any. The runner is taken
+    /// out for the duration so send_cmd/estop_all can borrow self; any
+    /// early return without putting it back means the script stopped.
+    fn script_tick(&mut self) {
+        let Some(mut runner) = self.runner.take() else {
+            return;
+        };
+        let tick = runner.tick(Instant::now());
+        for cmd in &tick.cmds {
+            if cmd == "<!>" {
+                // Route through estop_all so the loco tabs zero too.
+                self.estop_all();
+                if self.link.is_none() {
+                    self.run_status = "stopped: send failed".to_string();
+                    return;
+                }
+            } else if !self.send_cmd(cmd, false) {
+                self.run_status = "stopped: send failed".to_string();
+                return;
+            }
+        }
+        if tick.done {
+            self.run_status = "finished".to_string();
+            self.log("-- script finished", Tag::Info);
+        } else {
+            self.run_status = format!("running (line {})", tick.line);
+            self.runner = Some(runner);
+        }
+    }
+
+    fn run_script(&mut self) {
+        if self.link.is_none() {
+            self.run_status = "not connected".to_string();
+            return;
+        }
+        let sel = &self.scripts[self.script_sel];
+        let (name, text) = (sel.name.clone(), sel.text.clone());
+        match script::parse(&text) {
+            Err((line, msg)) => {
+                self.run_status = format!("error, line {line}: {msg}");
+                self.log(format!("-- script error, line {line}: {msg}"), Tag::Err);
+            }
+            Ok(prog) if prog.is_empty() => {
+                self.run_status = "script is empty".to_string();
+            }
+            Ok(prog) => {
+                self.runner = Some(Runner::new(prog));
+                self.run_status = "running...".to_string();
+                self.log(format!("-- script '{name}' started"), Tag::Info);
+            }
         }
     }
 
@@ -457,6 +586,45 @@ impl ThrottleApp {
             } else {
                 format!("address written: {addr}")
             };
+        }
+        // <H id 0|1> turnout broadcast; also the longer definition forms
+        // (<H id DCC addr subaddr state> etc.) -- id first, state last.
+        else if head == "H" && parts.len() >= 3 {
+            if let Ok(id) = parts[1].parse::<u32>() {
+                match *parts.last().unwrap() {
+                    "1" | "T" => {
+                        self.layout.states.insert(id, true);
+                    }
+                    "0" | "C" => {
+                        self.layout.states.insert(id, false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // <jT id1 id2 ...> turnout roster -> query each one;
+        // <jT id T|C|X ["desc"]> is the per-turnout answer.
+        else if head == "jT" {
+            let is_state = parts.len() >= 3 && matches!(parts[2], "T" | "C" | "X" | "0" | "1");
+            if is_state {
+                if let Ok(id) = parts[1].parse::<u32>() {
+                    match parts[2] {
+                        "T" | "1" => {
+                            self.layout.states.insert(id, true);
+                        }
+                        "C" | "0" => {
+                            self.layout.states.insert(id, false);
+                        }
+                        _ => {} // X = unknown; leave it unknown
+                    }
+                }
+            } else {
+                let ids: Vec<u32> =
+                    parts[1..].iter().filter_map(|p| p.parse().ok()).collect();
+                for id in ids {
+                    self.send_cmd(&format!("<JT {id}>"), true);
+                }
+            }
         }
         // <iDCC-EX V-5.x.x ...>
         else if head.starts_with('i') {
@@ -1132,6 +1300,475 @@ impl ThrottleApp {
         });
     }
 
+    fn automation_ui(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        let mut delete: Option<usize> = None;
+        self.script_sel = self.script_sel.min(self.scripts.len() - 1);
+
+        ui.group(|ui| {
+            ui.label(RichText::new("Automation Scripts").strong());
+            ui.horizontal(|ui| {
+                ui.label("Script:");
+                let current = self.scripts[self.script_sel].name.clone();
+                egui::ComboBox::from_id_salt("script_sel")
+                    .width(220.0)
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for i in 0..self.scripts.len() {
+                            let name = self.scripts[i].name.clone();
+                            ui.selectable_value(&mut self.script_sel, i, name);
+                        }
+                    });
+                if ui.button("New").clicked() {
+                    self.scripts.push(ScriptCfg {
+                        name: format!("Script {}", self.scripts.len() + 1),
+                        text: String::new(),
+                    });
+                    self.script_sel = self.scripts.len() - 1;
+                    save = true;
+                }
+                let deletable = self.scripts.len() > 1;
+                if ui
+                    .add_enabled(deletable, egui::Button::new("Delete"))
+                    .on_disabled_hover_text("The last script cannot be deleted.")
+                    .clicked()
+                {
+                    delete = Some(self.script_sel);
+                }
+                ui.add_space(12.0);
+                ui.label("Name:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.scripts[self.script_sel].name)
+                        .desired_width(180.0),
+                );
+                if resp.changed() {
+                    self.script_dirty = true;
+                }
+                if resp.lost_focus() {
+                    let name = &mut self.scripts[self.script_sel].name;
+                    if name.trim().is_empty() {
+                        // A nameless script would vanish on the next load.
+                        *name = format!("Script {}", self.script_sel + 1);
+                    }
+                    save = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                if self.runner.is_none() {
+                    if ui
+                        .add(egui::Button::new(RichText::new("Run").strong()))
+                        .clicked()
+                    {
+                        save = true; // Run also commits the text to disk
+                        self.run_script();
+                    }
+                } else {
+                    let stop = egui::Button::new(
+                        RichText::new("Stop Script").color(Color32::WHITE).strong(),
+                    )
+                    .fill(COL_ESTOP);
+                    if ui.add(stop).clicked() {
+                        self.runner = None;
+                        self.run_status = "stopped".to_string();
+                        self.log("-- script stopped", Tag::Info);
+                    }
+                }
+                // Explicit save (Ctrl+S works anywhere on this tab). Edits
+                // also auto-save when the editor loses focus, on Run, and
+                // on exit -- the button makes "it's on disk" a certainty
+                // instead of a side effect.
+                let ctrl_s = ui.input(|inp| {
+                    inp.modifiers.command && inp.key_pressed(egui::Key::S)
+                });
+                if ui
+                    .add_enabled(self.script_dirty, egui::Button::new("Save"))
+                    .on_disabled_hover_text("No unsaved changes.")
+                    .clicked()
+                    || (ctrl_s && self.script_dirty)
+                {
+                    save = true;
+                }
+                if self.script_dirty {
+                    ui.label(RichText::new("unsaved changes").color(COL_INFO));
+                }
+                ui.label(&self.run_status);
+            });
+        });
+
+        // The editor commits on focus loss (and on Save/Run/exit); a
+        // running script keeps executing its parsed copy, so editing is
+        // safe. changed() drives the unsaved-changes marker.
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut self.scripts[self.script_sel].text)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(18),
+        );
+        if resp.changed() {
+            self.script_dirty = true;
+        }
+        if resp.lost_focus() {
+            save = true;
+        }
+
+        egui::CollapsingHeader::new("Command reference")
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in [
+                    "speed CAB N          set speed 0-126 (keeps direction)",
+                    "forward CAB          direction forward (resends speed)",
+                    "reverse CAB          direction reverse",
+                    "stop CAB             speed 0",
+                    "estop                emergency stop everything",
+                    "func CAB N on|off    decoder function F0-F28",
+                    "pulse CAB N [SECS]   momentary function, default 0.5 s",
+                    "wait SECS            pause the script",
+                    "power on|off [main|prog]",
+                    "throw ID / close ID  turnouts (see the Layout tab)",
+                    "send CMD             raw DCC-EX command, <> optional",
+                    "repeat N ... end     loops, nestable",
+                    "# comment            anywhere on a line",
+                ] {
+                    ui.label(RichText::new(line).monospace());
+                }
+            });
+
+        if let Some(i) = delete {
+            self.scripts.remove(i);
+            if self.script_sel >= i && self.script_sel > 0 {
+                self.script_sel -= 1;
+            }
+            save = true;
+        }
+        if save {
+            self.save_config();
+        }
+    }
+
+    fn layout_ui(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.layout_edit, "Edit layout");
+            ui.add_space(12.0);
+            if self.layout_edit {
+                ui.label("Grid:");
+                let cols = ui.add(
+                    egui::DragValue::new(&mut self.layout.cols)
+                        .range(layout::MIN_SIZE..=layout::MAX_SIZE),
+                );
+                ui.label("x");
+                let rows = ui.add(
+                    egui::DragValue::new(&mut self.layout.rows)
+                        .range(layout::MIN_SIZE..=layout::MAX_SIZE),
+                );
+                if cols.changed() || rows.changed() {
+                    self.layout.prune();
+                    save = true;
+                }
+            } else {
+                if ui.button("Sync turnout states").clicked() {
+                    self.send_cmd("<JT>", false);
+                }
+                ui.weak("Click a turnout to throw/close it. Green = the route currently set.");
+            }
+        });
+
+        if self.layout_edit {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Tool:");
+                let kind = self.turnout_kind;
+                for (tool, tip) in [
+                    (Tool::Erase, "Erase"),
+                    (Tool::Track(Piece::EW), "Straight track, left-right"),
+                    (Tool::Track(Piece::NS), "Straight track, up-down"),
+                    (
+                        Tool::CurveLeft,
+                        "Curve Left: bends the run (or a turnout's diverging \
+                         leg) to the left; orients itself from the adjacent track",
+                    ),
+                    (
+                        Tool::CurveRight,
+                        "Curve Right: bends the run (or a turnout's diverging \
+                         leg) to the right; orients itself from the adjacent track",
+                    ),
+                    (
+                        Tool::Diagonal,
+                        "Diagonal: continues a turnout's diverging leg corner to \
+                         corner and levels off into an adjacent straight",
+                    ),
+                    (Tool::Track(Piece::Cross), "Crossing (no switching)"),
+                    (Tool::Turnout, "Turnout: pick the shape below, then click a cell"),
+                ] {
+                    let resp = tool_icon_button(ui, self.tool == tool, tip, |p, r, c| {
+                        draw_tool_icon(p, r, c, tool, kind)
+                    });
+                    if resp.clicked() {
+                        self.tool = tool;
+                    }
+                }
+            });
+            if self.tool == Tool::Turnout {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Turnout shape:");
+                    for k in TKind::ALL {
+                        let resp =
+                            tool_icon_button(ui, self.turnout_kind == k, k.label(), |p, r, c| {
+                                draw_turnout_icon(p, r, c, k)
+                            });
+                        if resp.clicked() {
+                            self.turnout_kind = k;
+                        }
+                    }
+                });
+            }
+            ui.weak(
+                "Left-click or drag to paint. Curves orient themselves from the \
+                 adjacent track (the arrow is which way the run bends) and also \
+                 take a turnout's diverging leg or a diagonal back into a \
+                 straight; re-click one to fix it after laying its neighbours. \
+                 Right-click a turnout, or click it with the Turnout tool, to \
+                 edit its DCC-EX turnout ID -- the same ID it has on the \
+                 command station.",
+            );
+            self.turnout_editor_ui(ui, &mut save);
+        }
+
+        ui.separator();
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.layout_canvas(ui, &mut save);
+            });
+        if save {
+            self.save_config();
+        }
+    }
+
+    /// The "selected turnout" row shown in edit mode: ID and orientation.
+    fn turnout_editor_ui(&mut self, ui: &mut egui::Ui, save: &mut bool) {
+        let Some(key) = self.sel_turnout else {
+            return;
+        };
+        // The selection can go stale (erased, grid shrunk); drop it quietly.
+        let Some(Cell::Turnout { id, kind }) = self.layout.cells.get(&key).cloned() else {
+            self.sel_turnout = None;
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Selected turnout (cell {},{}) - ID:", key.0, key.1));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.turnout_id_entry).desired_width(70.0),
+            );
+            if resp.lost_focus() {
+                match self.turnout_id_entry.trim().parse::<u32>() {
+                    Ok(new_id) if new_id <= layout::MAX_TURNOUT_ID && new_id != id => {
+                        if let Some(Cell::Turnout { id, .. }) = self.layout.cells.get_mut(&key)
+                        {
+                            *id = new_id;
+                        }
+                        *save = true;
+                    }
+                    Ok(_) => {}
+                    // not a number: put the real ID back rather than guess
+                    Err(_) => self.turnout_id_entry = id.to_string(),
+                }
+            }
+            ui.label("Shape:");
+            let mut sel_kind = kind;
+            for k in TKind::ALL {
+                let resp = tool_icon_button(ui, sel_kind == k, k.label(), |p, r, c| {
+                    draw_turnout_icon(p, r, c, k)
+                });
+                if resp.clicked() {
+                    sel_kind = k;
+                }
+            }
+            if sel_kind != kind {
+                if let Some(Cell::Turnout { kind, .. }) = self.layout.cells.get_mut(&key) {
+                    *kind = sel_kind;
+                }
+                *save = true;
+            }
+            if ui.button("Done").clicked() {
+                self.sel_turnout = None;
+            }
+        });
+    }
+
+    fn layout_canvas(&mut self, ui: &mut egui::Ui, save: &mut bool) {
+        use layout::CELL;
+        let size = egui::vec2(
+            self.layout.cols as f32 * CELL,
+            self.layout.rows as f32 * CELL,
+        );
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+        let origin = resp.rect.min;
+        painter.rect_filled(resp.rect, 4.0, COL_CONSOLE_BG);
+
+        if self.layout_edit {
+            for x in 0..=self.layout.cols {
+                let px = origin.x + x as f32 * CELL;
+                painter.line_segment(
+                    [egui::pos2(px, origin.y), egui::pos2(px, origin.y + size.y)],
+                    Stroke::new(1.0, COL_GRID),
+                );
+            }
+            for y in 0..=self.layout.rows {
+                let py = origin.y + y as f32 * CELL;
+                painter.line_segment(
+                    [egui::pos2(origin.x, py), egui::pos2(origin.x + size.x, py)],
+                    Stroke::new(1.0, COL_GRID),
+                );
+            }
+        }
+
+        let track = Stroke::new(4.0, COL_TRACK);
+        for (&(x, y), cell) in &self.layout.cells {
+            let cell_min =
+                egui::pos2(origin.x + x as f32 * CELL, origin.y + y as f32 * CELL);
+            let to_pos =
+                |p: (f32, f32)| egui::pos2(cell_min.x + p.0 * CELL, cell_min.y + p.1 * CELL);
+            match cell {
+                Cell::Track(piece) => {
+                    for seg in piece.segments() {
+                        painter.line_segment([to_pos(seg.0), to_pos(seg.1)], track);
+                    }
+                }
+                Cell::Turnout { id, kind } => {
+                    // Unknown state shows both routes in the warning colour
+                    // -- honest, and a nudge to hit "Sync turnout states".
+                    let (main_col, branch_col) = match self.layout.states.get(id) {
+                        Some(false) => (COL_ROUTE_SET, COL_ROUTE_OFF),
+                        Some(true) => (COL_ROUTE_OFF, COL_ROUTE_SET),
+                        None => (COL_INFO, COL_INFO),
+                    };
+                    // The unset route paints first so the set route (they
+                    // share the cell centre) draws on top of it.
+                    let branch = kind.branch();
+                    let mut segs: Vec<(layout::Seg, Color32)> = kind
+                        .main()
+                        .segments()
+                        .iter()
+                        .map(|&s| (s, main_col))
+                        .collect();
+                    let at = if main_col == COL_ROUTE_SET { 0 } else { segs.len() };
+                    segs.insert(at, (branch, branch_col));
+                    for (seg, col) in segs {
+                        painter.line_segment(
+                            [to_pos(seg.0), to_pos(seg.1)],
+                            Stroke::new(4.0, col),
+                        );
+                    }
+                    if self.layout_edit && self.sel_turnout == Some((x, y)) {
+                        painter.rect_stroke(
+                            egui::Rect::from_min_size(cell_min, egui::vec2(CELL, CELL)),
+                            3.0,
+                            Stroke::new(2.0, COL_INFO),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    painter.text(
+                        cell_min + egui::vec2(3.0, 1.0),
+                        egui::Align2::LEFT_TOP,
+                        id.to_string(),
+                        egui::FontId::proportional(11.0),
+                        COL_TX,
+                    );
+                }
+            }
+        }
+
+        // ---- interaction ----
+        let Some(pos) = resp.interact_pointer_pos() else {
+            return;
+        };
+        let (cx, cy) = (
+            ((pos.x - origin.x) / CELL).floor() as i64,
+            ((pos.y - origin.y) / CELL).floor() as i64,
+        );
+        if cx < 0 || cy < 0 || cx >= self.layout.cols as i64 || cy >= self.layout.rows as i64 {
+            return;
+        }
+        let key = (cx as u32, cy as u32);
+
+        if !self.layout_edit {
+            // Run mode: a click on a turnout toggles it. No optimistic
+            // repaint -- the colour flips when the <H> broadcast lands.
+            if resp.clicked()
+                && let Some(Cell::Turnout { id, .. }) = self.layout.cells.get(&key)
+            {
+                let id = *id;
+                let thrown = self.layout.states.get(&id) == Some(&true);
+                self.send_cmd(&format!("<T {id} {}>", !thrown as u8), false);
+            }
+            return;
+        }
+
+        // Edit mode. Right-click selects a turnout for the ID editor.
+        if resp.secondary_clicked() {
+            if let Some(Cell::Turnout { id, .. }) = self.layout.cells.get(&key) {
+                self.turnout_id_entry = id.to_string();
+                self.sel_turnout = Some(key);
+            }
+            return;
+        }
+        let painting = resp.clicked() || resp.dragged_by(egui::PointerButton::Primary);
+        if !painting {
+            return;
+        }
+        match self.tool {
+            Tool::Erase => {
+                if self.layout.cells.remove(&key).is_some() {
+                    *save = true;
+                }
+            }
+            Tool::Track(piece) => {
+                let cell = Cell::Track(piece);
+                if self.layout.cells.get(&key) != Some(&cell) {
+                    self.layout.cells.insert(key, cell);
+                    *save = true;
+                }
+            }
+            Tool::CurveLeft | Tool::CurveRight | Tool::Diagonal => {
+                // Click only: dragging would chain half-oriented pieces.
+                // Re-clicking re-runs the pick against the current
+                // neighbours, so a piece laid too early is one click to fix.
+                if !resp.clicked() {
+                    return;
+                }
+                let piece = match self.tool {
+                    Tool::Diagonal => self.layout.pick_diagonal(key),
+                    tool => self.layout.pick_curve(key, tool == Tool::CurveLeft),
+                };
+                let cell = Cell::Track(piece);
+                if self.layout.cells.get(&key) != Some(&cell) {
+                    self.layout.cells.insert(key, cell);
+                    *save = true;
+                }
+            }
+            Tool::Turnout => {
+                // Click only -- dragging a turnout tool across the plan must
+                // not scatter turnouts with auto-assigned IDs.
+                if !resp.clicked() {
+                    return;
+                }
+                if let Some(Cell::Turnout { id, .. }) = self.layout.cells.get(&key) {
+                    // clicking an existing turnout selects it instead
+                    self.turnout_id_entry = id.to_string();
+                    self.sel_turnout = Some(key);
+                } else {
+                    let id = self.layout.next_free_id();
+                    self.layout
+                        .cells
+                        .insert(key, Cell::Turnout { id, kind: self.turnout_kind });
+                    self.turnout_id_entry = id.to_string();
+                    self.sel_turnout = Some(key);
+                    *save = true;
+                }
+            }
+        }
+    }
+
     fn console_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Console").strong());
         let entry_height = 34.0;
@@ -1178,12 +1815,103 @@ impl ThrottleApp {
     }
 }
 
+// ---------------- layout tool icons ----------------
+// The palette buttons draw the piece they place instead of naming it --
+// a compass word tells you nothing at a glance, the shape does.
+
+fn unit_pos(r: egui::Rect, p: (f32, f32)) -> egui::Pos2 {
+    egui::pos2(r.min.x + p.0 * r.width(), r.min.y + p.1 * r.height())
+}
+
+fn icon_segs(painter: &egui::Painter, r: egui::Rect, segs: &[layout::Seg], color: Color32) {
+    for &(a, b) in segs {
+        painter.line_segment([unit_pos(r, a), unit_pos(r, b)], Stroke::new(3.0, color));
+    }
+}
+
+fn draw_turnout_icon(painter: &egui::Painter, r: egui::Rect, color: Color32, kind: TKind) {
+    icon_segs(painter, r, kind.main().segments(), color);
+    icon_segs(painter, r, &[kind.branch()], color);
+}
+
+fn draw_tool_icon(
+    painter: &egui::Painter,
+    r: egui::Rect,
+    color: Color32,
+    tool: Tool,
+    turnout_kind: TKind,
+) {
+    match tool {
+        Tool::Erase => icon_segs(
+            painter,
+            r,
+            &[((0.2, 0.2), (0.8, 0.8)), ((0.8, 0.2), (0.2, 0.8))],
+            color,
+        ),
+        Tool::Track(piece) => icon_segs(painter, r, piece.segments(), color),
+        // The curve tools have no fixed shape (they orient on placement),
+        // so the icon shows the idea: the run comes in, and bends the way
+        // the arrow points.
+        Tool::CurveLeft => icon_segs(
+            painter,
+            r,
+            &[
+                ((0.0, 0.5), (0.5, 0.5)),
+                ((0.5, 0.5), (0.5, 0.1)),
+                ((0.28, 0.36), (0.5, 0.08)),
+                ((0.72, 0.36), (0.5, 0.08)),
+            ],
+            color,
+        ),
+        Tool::CurveRight => icon_segs(
+            painter,
+            r,
+            &[
+                ((0.0, 0.5), (0.5, 0.5)),
+                ((0.5, 0.5), (0.5, 0.9)),
+                ((0.28, 0.64), (0.5, 0.92)),
+                ((0.72, 0.64), (0.5, 0.92)),
+            ],
+            color,
+        ),
+        Tool::Diagonal => icon_segs(painter, r, &[((0.1, 0.9), (0.9, 0.1))], color),
+        Tool::Turnout => draw_turnout_icon(painter, r, color, turnout_kind),
+    }
+}
+
+/// A paint-your-own-icon toggle button for the layout palette.
+fn tool_icon_button(
+    ui: &mut egui::Ui,
+    selected: bool,
+    tip: &str,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 34.0), egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&resp, selected);
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else {
+        visuals.weak_bg_fill
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    ui.painter()
+        .rect_stroke(rect, 4.0, visuals.bg_stroke, egui::StrokeKind::Inside);
+    let color = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        visuals.text_color()
+    };
+    draw(ui.painter(), rect.shrink(6.0), color);
+    resp.on_hover_text(tip)
+}
+
 impl eframe::App for ThrottleApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump();
         self.speed_tick();
         self.current_tick();
+        self.script_tick();
 
         egui::Panel::top("top_band").show(ui, |ui| {
             self.connection_ui(ui, &ctx);
@@ -1203,6 +1931,8 @@ impl eframe::App for ThrottleApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.main_tab, MainTab::Run, "Run");
                 ui.selectable_value(&mut self.main_tab, MainTab::Programming, "Programming");
+                ui.selectable_value(&mut self.main_tab, MainTab::Automation, "Automation");
+                ui.selectable_value(&mut self.main_tab, MainTab::Layout, "Layout");
             });
             ui.separator();
             match self.main_tab {
@@ -1223,6 +1953,15 @@ impl eframe::App for ThrottleApp {
                             self.programming_ui(ui);
                         });
                 }
+                MainTab::Automation => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.automation_ui(ui);
+                        });
+                }
+                // layout_ui brings its own (two-way) scroll area
+                MainTab::Layout => self.layout_ui(ui),
             }
         });
 

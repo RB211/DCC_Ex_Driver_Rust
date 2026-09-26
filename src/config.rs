@@ -1,9 +1,12 @@
-//! Per-loco configuration, shared with the Python app.
+//! App configuration, shared with the Python app.
 //!
 //! CONFIG_PATH schema: {"locos": [{"name": str, "address": int,
-//!   "toggle_funcs": [int], "show_funcs": [int], "labels": {"n": str}}]}
-//! The pre-multi-loco file was {"toggle_funcs": [int]}; load_loco_cfgs()
-//! migrates it to a single loco so nobody loses their button modes.
+//!   "toggle_funcs": [int], "show_funcs": [int], "labels": {"n": str}}],
+//!   "scripts": [{"name": str, "text": str}], "layout": {...}}
+//! The pre-multi-loco file was {"toggle_funcs": [int]}; loading migrates it
+//! to a single loco so nobody loses their button modes. "scripts" and
+//! "layout" are Rust-only additions; the Python app ignores them. The
+//! layout value is opaque here -- layout.rs owns its schema.
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,12 +108,46 @@ fn clean_loco_cfg(raw: &Value) -> Option<LocoCfg> {
     Some(cfg)
 }
 
-/// The loco list from the config file, migrated/sanitized, never empty.
-pub fn load_loco_cfgs() -> Vec<LocoCfg> {
-    match fs::read_to_string(config_path()) {
-        Ok(text) => cfgs_from_json(&text),
-        Err(_) => vec![LocoCfg::default()],
+/// A named automation script (the Automation tab's unit of storage).
+#[derive(Clone, Debug)]
+pub struct ScriptCfg {
+    pub name: String,
+    pub text: String,
+}
+
+pub struct AppCfg {
+    pub locos: Vec<LocoCfg>,
+    pub scripts: Vec<ScriptCfg>,
+    /// The raw "layout" value, decoded by layout::Layout::from_json.
+    pub layout: Value,
+}
+
+/// Everything from the config file, migrated/sanitized; locos never empty.
+pub fn load_app_cfg() -> AppCfg {
+    let text = fs::read_to_string(config_path()).unwrap_or_default();
+    let data: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    AppCfg {
+        locos: cfgs_from_json(&text),
+        scripts: scripts_from_json(&data),
+        layout: data.get("layout").cloned().unwrap_or(Value::Null),
     }
+}
+
+fn scripts_from_json(data: &Value) -> Vec<ScriptCfg> {
+    let Some(arr) = data.get("scripts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|s| {
+            let obj = s.as_object()?;
+            let name = obj.get("name").and_then(Value::as_str)?.trim();
+            let text = obj.get("text").and_then(Value::as_str)?;
+            if name.is_empty() {
+                return None;
+            }
+            Some(ScriptCfg { name: name.to_string(), text: text.to_string() })
+        })
+        .collect()
 }
 
 /// Testable core of load_loco_cfgs: parse + migrate one JSON document.
@@ -139,7 +176,11 @@ fn cfgs_from_json(text: &str) -> Vec<LocoCfg> {
     fallback()
 }
 
-pub fn save_loco_cfgs(cfgs: &[LocoCfg]) -> std::io::Result<()> {
+pub fn save_app_cfg(
+    cfgs: &[LocoCfg],
+    scripts: &[ScriptCfg],
+    layout: Value,
+) -> std::io::Result<()> {
     let locos: Vec<Value> = cfgs
         .iter()
         .map(|c| {
@@ -154,11 +195,16 @@ pub fn save_loco_cfgs(cfgs: &[LocoCfg]) -> std::io::Result<()> {
             })
         })
         .collect();
+    let scripts: Vec<Value> = scripts
+        .iter()
+        .map(|s| json!({"name": s.name, "text": s.text}))
+        .collect();
     let path = config_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(&path, serde_json::to_string_pretty(&json!({ "locos": locos }))?)
+    let doc = json!({ "locos": locos, "scripts": scripts, "layout": layout });
+    fs::write(&path, serde_json::to_string_pretty(&doc)?)
 }
 
 #[cfg(test)]
@@ -198,6 +244,24 @@ mod tests {
         assert_eq!(c.show_funcs, [1u8, 2].into_iter().collect());
         assert_eq!(c.labels.get(&2).map(String::as_str), Some("Horn"));
         assert_eq!(c.labels.len(), 1);
+    }
+
+    #[test]
+    fn scripts_sanitized() {
+        let data: Value = serde_json::from_str(
+            r#"{"scripts": [
+                {"name": " Shuttle ", "text": "wait 1"},
+                {"name": "", "text": "dropped"},
+                {"name": "no text"},
+                "junk"
+            ]}"#,
+        )
+        .unwrap();
+        let scripts = scripts_from_json(&data);
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].name, "Shuttle");
+        assert_eq!(scripts[0].text, "wait 1");
+        assert!(scripts_from_json(&Value::Null).is_empty());
     }
 
     #[test]
