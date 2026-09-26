@@ -1,0 +1,12 @@
+[package]
+name = "dccex-throttle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.36.2"
+serde_json = "1.0.151"
+serialport = "4.10.1"
+
+[profile.release]
+strip = true
